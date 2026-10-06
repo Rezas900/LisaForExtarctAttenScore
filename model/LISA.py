@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN)
+                         DEFAULT_IMAGE_PATCH_TOKEN, IMAGE_TOKEN_INDEX)
 
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
@@ -14,11 +14,11 @@ from .segment_anything import build_sam_vit_h
 
 
 def dice_loss(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    num_masks: float,
-    scale=1000,  # 100000.0,
-    eps=1e-6,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
+        scale=1000,  # 100000.0,
+        eps=1e-6,
 ):
     """
     Compute the DICE loss, similar to generalized IOU for masks
@@ -40,9 +40,9 @@ def dice_loss(
 
 
 def sigmoid_ce_loss(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    num_masks: float,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        num_masks: float,
 ):
     """
     Args:
@@ -61,9 +61,9 @@ def sigmoid_ce_loss(
 
 class LisaMetaModel:
     def __init__(
-        self,
-        config,
-        **kwargs,
+            self,
+            config,
+            **kwargs,
     ):
         super(LisaMetaModel, self).__init__(config)
 
@@ -103,9 +103,9 @@ class LisaMetaModel:
 
 class LisaModel(LisaMetaModel, LlavaLlamaModel):
     def __init__(
-        self,
-        config,
-        **kwargs,
+            self,
+            config,
+            **kwargs,
     ):
         super(LisaModel, self).__init__(config, **kwargs)
 
@@ -122,9 +122,9 @@ class LisaModel(LisaMetaModel, LlavaLlamaModel):
 
 class LISAForCausalLM(LlavaLlamaForCausalLM):
     def __init__(
-        self,
-        config,
-        **kwargs,
+            self,
+            config,
+            **kwargs,
     ):
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
@@ -136,7 +136,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         else:
             config.mm_vision_tower = config.vision_tower
-            
+
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
         super().__init__(config)
@@ -167,18 +167,18 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         return self.model_forward(**kwargs)
 
     def model_forward(
-        self,
-        images: torch.FloatTensor,
-        images_clip: torch.FloatTensor,
-        input_ids: torch.LongTensor,
-        labels: torch.LongTensor,
-        attention_masks: torch.LongTensor,
-        offset: torch.LongTensor,
-        masks_list: List[torch.FloatTensor],
-        label_list: List[torch.Tensor],
-        resize_list: List[tuple],
-        inference: bool = False,
-        **kwargs,
+            self,
+            images: torch.FloatTensor,
+            images_clip: torch.FloatTensor,
+            input_ids: torch.LongTensor,
+            labels: torch.LongTensor,
+            attention_masks: torch.LongTensor,
+            offset: torch.LongTensor,
+            masks_list: List[torch.FloatTensor],
+            label_list: List[torch.Tensor],
+            resize_list: List[tuple],
+            inference: bool = False,
+            **kwargs,
     ):
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
@@ -314,17 +314,17 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             pred_mask = pred_masks[batch_idx]
 
             assert (
-                gt_mask.shape[0] == pred_mask.shape[0]
+                    gt_mask.shape[0] == pred_mask.shape[0]
             ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
                 gt_mask.shape, pred_mask.shape
             )
             mask_bce_loss += (
-                sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
+                    sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                    * gt_mask.shape[0]
             )
             mask_dice_loss += (
-                dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
+                    dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                    * gt_mask.shape[0]
             )
             num_masks += gt_mask.shape[0]
 
@@ -342,15 +342,119 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             "mask_loss": mask_loss,
         }
 
+    @torch.no_grad()
+    def get_seg_visual_attention(self, images_clip, output_ids, query="seg"):
+        """
+        Attention of every [SEG] token (query) over the visual tokens ONLY (keys).
+
+        LISA sets config.use_cache=False and the LM is causal, so one extra
+        teacher-forced forward pass over the final generated sequence yields exactly
+        the attention rows the model had when it produced each token. This avoids
+        hooks and avoids keeping per-step attentions inside generate().
+
+        Args:
+            images_clip: CLIP-preprocessed image, shape (1, 3, 224, 224).
+            output_ids:  generate() sequences, shape (1, T). They still contain the
+                         IMAGE_TOKEN_INDEX placeholder (it is expanded to the visual
+                         tokens inside the LLaVA forward).
+            query:       "seg"  -> use the row of the [SEG] token itself.
+                         "lisa" -> use the row one position earlier. This is the
+                                   position whose hidden state LISA actually feeds to
+                                   the SAM prompt encoder (see the `[:, 1:]` shift in
+                                   seg_token_mask).
+
+        Returns None if no [SEG] token was generated, otherwise a dict:
+            "attn":      float32 CPU tensor (n_layers, n_heads, n_seg, n_visual)
+                         -> softmax attention probabilities (rows of the full
+                         attention matrix restricted to the visual-token columns,
+                         NOT renormalised, so each row sums to <= 1).
+            "grid_size": g, with n_visual == g * g (row-major patch order)
+            "visual_range":     (start, end) of the visual tokens in the expanded sequence
+            "seg_positions":    positions of the [SEG] tokens in the expanded sequence
+            "query_positions":  positions actually used as attention queries
+            "query", "seq_len"
+        """
+        assert query in ("seg", "lisa"), query
+        ids = output_ids[:1]  # inference script uses batch size 1
+        seq = ids[0]
+
+        # ---- locate the visual tokens in the expanded sequence
+        img_pos = (seq == IMAGE_TOKEN_INDEX).nonzero().flatten()
+        assert img_pos.numel() == 1, "expected exactly one image token in output_ids"
+        img_start = int(img_pos[0])
+
+        vision_tower = self.get_model().get_vision_tower()
+        n_patches = getattr(vision_tower, "num_patches", None)
+        if n_patches is None:
+            cfg = vision_tower.config
+            n_patches = (cfg.image_size // cfg.patch_size) ** 2
+        grid = int(round(n_patches ** 0.5))
+        assert grid * grid == n_patches, n_patches
+        img_end = img_start + n_patches  # visual tokens: [img_start, img_end)
+
+        # ---- locate the [SEG] tokens in the expanded sequence
+        # one placeholder id becomes n_patches embeddings => +(n_patches - 1) shift
+        seg_orig = (seq == self.seg_token_idx).nonzero().flatten()
+        seg_orig = seg_orig[seg_orig > img_start]
+        if seg_orig.numel() == 0:
+            return None
+        seg_pos = seg_orig + (n_patches - 1)
+        q_pos = seg_pos - 1 if query == "lisa" else seg_pos
+
+        # ---- one forward pass, ask for attention maps
+        out = super().forward(
+            images=images_clip,
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids),
+            output_attentions=True,
+            output_hidden_states=False,
+            use_cache=False,
+            return_dict=True,
+        )
+        attentions = getattr(out, "attentions", None)
+        if attentions is None or attentions[0] is None:
+            raise RuntimeError(
+                "The model returned no attention maps. Use eager attention "
+                "(no flash-attn / SDPA) so that output_attentions=True works."
+            )
+        expanded_len = ids.shape[1] + n_patches - 1
+        assert attentions[0].shape[-1] == expanded_len, (
+            attentions[0].shape,
+            expanded_len,
+        )
+
+        rows = []
+        for layer_attn in attentions:  # each: (1, H, T, T), may live on different GPUs
+            a = layer_attn[0]  # (H, T, T)
+            qi = q_pos.to(a.device)
+            rows.append(
+                a.index_select(1, qi)[..., img_start:img_end].float().cpu()
+            )  # (H, S, N)
+        attn = torch.stack(rows, dim=0)  # (L, H, S, N)
+        del out, attentions
+        torch.cuda.empty_cache()
+
+        return {
+            "attn": attn,
+            "grid_size": grid,
+            "visual_range": (img_start, img_end),
+            "seg_positions": seg_pos.tolist(),
+            "query_positions": q_pos.tolist(),
+            "query": query,
+            "seq_len": expanded_len,
+        }
+
     def evaluate(
-        self,
-        images_clip,
-        images,
-        input_ids,
-        resize_list,
-        original_size_list,
-        max_new_tokens=32,
-        tokenizer=None,
+            self,
+            images_clip,
+            images,
+            input_ids,
+            resize_list,
+            original_size_list,
+            max_new_tokens=32,
+            tokenizer=None,
+            return_seg_attention=False,
+            attn_query="seg",
     ):
         with torch.no_grad():
             outputs = self.generate(
@@ -423,5 +527,11 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     original_size=original_size_list[i],
                 )
                 pred_masks.append(pred_mask[:, 0])
+
+        if return_seg_attention:
+            seg_attention = self.get_seg_visual_attention(
+                images_clip, output_ids, query=attn_query
+            )
+            return output_ids, pred_masks, seg_attention
 
         return output_ids, pred_masks

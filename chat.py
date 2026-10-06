@@ -43,6 +43,29 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
+    # ---- [SEG] -> visual-token attention options
+    parser.add_argument(
+        "--disable_seg_attn",
+        action="store_true",
+        default=False,
+        help="do not compute / save the [SEG]->visual-token attention",
+    )
+    parser.add_argument(
+        "--attn_layers",
+        default="all",
+        type=str,
+        help='decoder layers used for the aggregated map: "all", "last", '
+        'a range "16-31" or a list "0,8,31" (0-based). The raw file always '
+        "contains every layer.",
+    )
+    parser.add_argument(
+        "--attn_query",
+        default="seg",
+        type=str,
+        choices=["seg", "lisa"],
+        help='"seg": attention row of the [SEG] token itself; "lisa": the row one '
+        "position earlier, i.e. the hidden state LISA feeds to SAM.",
+    )
     return parser.parse_args(args)
 
 
@@ -61,6 +84,141 @@ def preprocess(
     padw = img_size - w
     x = F.pad(x, (0, padw, 0, padh))
     return x
+
+
+# --------------------------------------------------------------------------
+# [SEG] -> visual-token attention helpers
+# --------------------------------------------------------------------------
+def parse_layer_spec(spec, n_layers):
+    """'all' | 'last' | '16-31' | '0,8,31'  ->  sorted list of 0-based layer ids."""
+    spec = spec.strip().lower()
+    if spec == "all":
+        return list(range(n_layers))
+    if spec == "last":
+        return [n_layers - 1]
+    layers = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-")
+            layers.extend(range(int(a), int(b) + 1))
+        else:
+            layers.append(int(part))
+    layers = sorted(set(layers))
+    assert all(0 <= l < n_layers for l in layers), (
+        "attn_layers out of range, the model has {} layers".format(n_layers)
+    )
+    return layers
+
+
+def aggregate_seg_attention(attn, layers):
+    """
+    attn: (L, H, S, N) tensor from LISAForCausalLM.get_seg_visual_attention.
+    Returns (S, N): mean over the selected layers and over all heads.
+    """
+    return attn[layers].mean(dim=(0, 1))
+
+
+def clip_view_box(h, w, clip_image_processor):
+    """
+    CLIPImageProcessor resizes the shortest edge to 224 and CENTER-CROPS a square.
+    So the 16x16 patch grid only covers this square region of the original image.
+    Returns (top, left, crop_h, crop_w) in original-image pixels.
+    """
+    if getattr(clip_image_processor, "do_center_crop", True):
+        side = min(h, w)
+        return (h - side) // 2, (w - side) // 2, side, side
+    return 0, 0, h, w
+
+
+def make_heatmap(grid_map, h, w, crop_box):
+    """
+    grid_map: (g, g) tensor (one [SEG] token). Min-max normalised to [0, 1], then
+    resized with BILINEAR interpolation to the region of the original image that
+    CLIP saw, and placed on an (h, w) canvas.
+    Returns heat (h, w) float32 in [0, 1] and valid (h, w) bool (inside CLIP view).
+    """
+    top, left, ch, cw = crop_box
+    g = grid_map.float()
+    g = (g - g.min()) / (g.max() - g.min() + 1e-12)
+    up = F.interpolate(
+        g[None, None], size=(ch, cw), mode="bilinear", align_corners=False
+    )[0, 0]
+    up = up.clamp(0, 1).numpy()
+
+    heat = np.zeros((h, w), dtype=np.float32)
+    valid = np.zeros((h, w), dtype=bool)
+    heat[top : top + ch, left : left + cw] = up
+    valid[top : top + ch, left : left + cw] = True
+    return heat, valid
+
+
+def save_heatmap_images(heat, valid, image_rgb, heat_path, overlay_path, alpha=0.5):
+    """Pure heat map + overlay on the original image (outside CLIP's view = darkened)."""
+    heat_u8 = np.uint8(np.clip(heat, 0, 1) * 255)
+    color = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)  # BGR
+    color[~valid] = 0
+    cv2.imwrite(heat_path, color)
+
+    img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR).astype(np.float32)
+    overlay = img_bgr.copy()
+    overlay[valid] = (1 - alpha) * img_bgr[valid] + alpha * color[valid].astype(
+        np.float32
+    )
+    overlay[~valid] *= 0.3
+    cv2.imwrite(overlay_path, overlay.astype(np.uint8))
+
+
+def save_seg_attention(seg_attn, image_np, base_name, args, clip_image_processor):
+    """Save raw / aggregated attention matrices and heat maps for every [SEG] token."""
+    if seg_attn is None:
+        print("No [SEG] token was generated -> no attention to save.")
+        return
+
+    attn = seg_attn["attn"]  # (L, H, S, N)
+    n_layers, n_heads, n_seg, n_vis = attn.shape
+    g = seg_attn["grid_size"]
+    layers = parse_layer_spec(args.attn_layers, n_layers)
+    agg = aggregate_seg_attention(attn, layers)  # (S, N)
+    grid_maps = agg.reshape(n_seg, g, g)  # row-major patch order
+
+    h, w = image_np.shape[:2]
+    crop_box = clip_view_box(h, w, clip_image_processor)
+
+    prefix = "{}/{}".format(args.vis_save_path, base_name)
+
+    raw_path = "{}_seg_attn_raw.npy".format(prefix)
+    np.save(raw_path, attn.numpy())  # (L, H, S, N)
+    agg_path = "{}_seg_attn_grid.npy".format(prefix)
+    np.save(agg_path, grid_maps.numpy())  # (S, g, g)
+    print(
+        "[SEG] attention (query={}, layers={}, {} seg token(s)):".format(
+            seg_attn["query"], args.attn_layers, n_seg
+        )
+    )
+    print("{} has been saved. shape (layers, heads, seg, visual) = {}".format(
+        raw_path, tuple(attn.shape)))
+    print("{} has been saved. shape (seg, {}, {})".format(agg_path, g, g))
+
+    for j in range(n_seg):
+        gm = grid_maps[j]
+        mass = float(gm.sum())
+        peak = int(gm.reshape(-1).argmax())
+        print(
+            "  seg {}: attention mass on visual tokens = {:.4f}, peak patch (row, col) = ({}, {})".format(
+                j, mass, peak // g, peak % g
+            )
+        )
+
+        csv_path = "{}_seg{}_attn_grid.csv".format(prefix, j)
+        np.savetxt(csv_path, gm.numpy(), delimiter=",", fmt="%.6e")
+
+        heat, valid = make_heatmap(gm, h, w, crop_box)
+        heat_path = "{}_seg{}_attn_heatmap.png".format(prefix, j)
+        overlay_path = "{}_seg{}_attn_overlay.png".format(prefix, j)
+        save_heatmap_images(heat, valid, image_np, heat_path, overlay_path)
+        for p in (csv_path, heat_path, overlay_path):
+            print("{} has been saved.".format(p))
 
 
 def main(args):
@@ -151,6 +309,8 @@ def main(args):
 
     model.eval()
 
+    use_seg_attn = not args.disable_seg_attn
+
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
@@ -208,7 +368,8 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
 
-        output_ids, pred_masks = model.evaluate(
+        # evaluate() keeps its old 2-value return unless return_seg_attention=True
+        result = model.evaluate(
             image_clip,
             image,
             input_ids,
@@ -216,37 +377,54 @@ def main(args):
             original_size_list,
             max_new_tokens=512,
             tokenizer=tokenizer,
+            return_seg_attention=use_seg_attn,
+            attn_query=args.attn_query,
         )
+        if use_seg_attn:
+            output_ids, pred_masks, seg_attn = result
+        else:
+            output_ids, pred_masks = result
+            seg_attn = None
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
         text_output = text_output.replace("\n", "").replace("  ", " ")
         print("text_output: ", text_output)
 
+        base_name = image_path.split("/")[-1].split(".")[0]
+
         for i, pred_mask in enumerate(pred_masks):
             if pred_mask.shape[0] == 0:
                 continue
 
-            pred_mask = pred_mask.detach().cpu().numpy()[0]
-            pred_mask = pred_mask > 0
+            pred_mask_all = pred_mask.detach().cpu().numpy()
+            # j-th mask <-> j-th [SEG] token (same order as seg_attn). j == 0 keeps
+            # the original file names; further [SEG] tokens get a "_seg{j}" suffix.
+            for j in range(pred_mask_all.shape[0]):
+                pred_mask = pred_mask_all[j]
+                pred_mask = pred_mask > 0
+                suffix = "" if j == 0 else "_seg{}".format(j)
 
-            save_path = "{}/{}_mask_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
-            )
-            cv2.imwrite(save_path, pred_mask * 100)
-            print("{} has been saved.".format(save_path))
+                save_path = "{}/{}_mask_{}{}.jpg".format(
+                    args.vis_save_path, base_name, i, suffix
+                )
+                cv2.imwrite(save_path, pred_mask * 100)
+                print("{} has been saved.".format(save_path))
 
-            save_path = "{}/{}_masked_img_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
-            )
-            save_img = image_np.copy()
-            save_img[pred_mask] = (
-                image_np * 0.5
-                + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
-            )[pred_mask]
-            save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(save_path, save_img)
-            print("{} has been saved.".format(save_path))
+                save_path = "{}/{}_masked_img_{}{}.jpg".format(
+                    args.vis_save_path, base_name, i, suffix
+                )
+                save_img = image_np.copy()
+                save_img[pred_mask] = (
+                    image_np * 0.5
+                    + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
+                )[pred_mask]
+                save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(save_path, save_img)
+                print("{} has been saved.".format(save_path))
+
+        if use_seg_attn:
+            save_seg_attention(seg_attn, image_np, base_name, args, clip_image_processor)
 
 
 if __name__ == "__main__":
